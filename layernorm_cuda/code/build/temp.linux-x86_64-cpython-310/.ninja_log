@@ -1,0 +1,3 @@
+# ninja log v5
+0	23416	1730569525313483856	/home/avi/dev_code/layernorm_cuda/build/temp.linux-x86_64-cpython-310/layernorm_cuda.o	3413bf9252348b97
+0	63108	1730569564993386130	/home/avi/dev_code/layernorm_cuda/build/temp.linux-x86_64-cpython-310/layernorm_kernel.o	306c52c14f78c7d4
