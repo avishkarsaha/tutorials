@@ -303,7 +303,7 @@ With that simple example out of the way, we can now move onto what makes CUDA ke
    Imagine workers picking items:
    - Bad patterns: Each worker runs to a different part of the warehouse
    - Good pattern: Workers line up at one shelf, each grabbing the next item
-   - Result: the warehouse robot can deliver 32 adjacent items in one go
+     - Result: the warehouse robot can deliver 32 adjacent items in one go
 
 ---
 3. **Too Much Synchronization**
@@ -364,21 +364,21 @@ Now we can summarize efficient CUDA programming as:
 
 4. **Avoiding Synchronization When Possible**
   - Only using __syncthreads() when threads truly need to share results
-  - Letting threads work independently when they don't need to coordinate
+  - Let threads work independently when they don't need to coordinate
   - Grouping necessary synchronization points instead of frequent syncs
 
 We'll put these principles into practice in our LayerNorm implementation in the following sections.
 
-## 3. Implementation Journey: From PyTorch to CUDA
+## Implementation Journey: From PyTorch to CUDA
 
 ### LayerNorm in PyTorch and its Challenges in CUDA
-Let's look at how LayerNorm works in PyTorch, and why this approach raises challenging questions when implementing in CUDA:
+Let's look at how LayerNorm works in PyTorch, and why it presents opportunities for optimization in CUDA:
 
 ```python
 def pytorch_layernorm(x, weight, bias, eps=1e-5):
     # x shape: (batch_size, hidden_size)
     
-    # 1. Calculate mean for each sequence
+    # 1. Calculate mean for each item/sequence in batch
     mean = x.mean(dim=1, keepdim=True)      
     
     # 2. Calculate variance and normalize
@@ -389,7 +389,7 @@ def pytorch_layernorm(x, weight, bias, eps=1e-5):
     # 3. Apply scale and shift
     return x_norm * weight + bias
 ```
-Now lets analyze each step and the challenges it presents for CUDA:
+Now lets analyze each step and the key considerations for moving this to CUDA:
 #### 1. Computing the mean:
 ```python
 mean = x.mean()  # Really doing: sum(sequence)/len(sequence)
@@ -406,10 +406,10 @@ var = (x_centered ** 2).mean()
 ```
    Key Questions:
    - How do we ensure all threads have the correct mean? (Threads need to share results from step 1 - memory coalescing is important here)
-   - Can we avoid reading x again? (Remember: global memory access is expensive, we want to minimize it)
+   - Can we avoid reading `x` again? (Remember: global memory access is expensive, we want to minimize it)
    - Where do we store intermediate results? (Ties back to choosing the right memory type for the right task)
 
-#### The Challenge of Moving to CUDA
+#### The Challenges of Moving to CUDA
 So to summarize and relate these challenges back to our performance principles, here's what we need to consider:
 1. **Memory efficiency:** Can we avoid multiple passes through global memory?
 2. **Thread cooperation:** How can we efficiently share partial sums without excessive synchronization?
@@ -419,11 +419,11 @@ So to summarize and relate these challenges back to our performance principles, 
 
 ### CUDA Implementation Strategy
 
-Let's see how we solve these challenges:
+Alright let's look at one way to address these challenges:
 
 1. **Memory Challenge: Multiple Reads**
    
-   From our first principle, we want to minimize memory access time. Here's our solution:
+   From our first principle, we want to minimize memory access time. Here's a solution:
    ```cuda
    // PyTorch way (pseudocode):
    mean = sum(x) / N            // First read
@@ -437,7 +437,7 @@ Let's see how we solve these challenges:
    float val = input[tid];  // Read ONCE, kept in register for reuse
    
    // block_reduce: A way for all threads to sum their values together
-   // (We'll explain the exact mechanism in the Communication section)
+   // (We'll explain the exact mechanism in the Communication Challenge section later)
    float sum = block_reduce(val);
    
    float mean = sum / N;
@@ -449,7 +449,7 @@ Let's see how we solve these challenges:
 
    - Each thread reads from global memory exactly once
    - Value stays in ultra-fast register for reuse
-   - No need to store intermediate x_centered in memory
+   - No need to store intermediate variable `x_centered` in memory
    
 
 2. **Thread Collaboration Challenge**
@@ -483,9 +483,15 @@ Let's see how we solve these challenges:
    
    Why this is efficient:
    
-      - Each thread knows exactly what data to process
-      - Memory access is coalesced (remember the performance principle)
-      - No thread divergence - all threads follow same path
+      - **Each thread knows exactly what data to process**
+        - thread ID (`tid`) determines which values it handles
+        - No complex logic needed to figure out work distribution
+      - **Memory access is coalesced (remember the performance principle)**
+        - Threads read adjacent memory locations
+        - GPU can load multiple values in a single operation
+      - **No thread divergence - all threads follow same path**
+        - Each thread executes same number of iterations
+        - All threads stay in lockstep, no waiting for others to finish
    
 
 3. **Communication Challenge**
@@ -493,79 +499,82 @@ Let's see how we solve these challenges:
     Finally, we address the challenge of how threads share results. In PyTorch, `sum()` just works, but in CUDA, threads must share results:
    
    -To compute a sum across all threads, we need what's called a "reduction" - combining many values into a single result. Let's first see how this works with a simple 8-thread example:
-```text
-Let's say we have 8 threads, each with a value to sum:
-Thread:   0    1    2    3    4    5    6    7
-Value:    5    3    8    1    4    2    7    6
+    ```text
+    Let's say we have 8 threads, each with a value to sum:
+    Thread:   0    1    2    3    4    5    6    7
+    Value:    5    3    8    1    4    2    7    6
+    
+    Step 1 (distance=4): Each thread shares with thread+4
+    Thread 0 shares with Thread 4:  5+4=9
+    Thread 1 shares with Thread 5:  3+2=5
+    Thread 2 shares with Thread 6:  8+7=15
+    Thread 3 shares with Thread 7:  1+6=7
+    After step 1:
+    Thread:   0    1    2    3    4    5    6    7
+    Value:    9    5    15   7    -    -    -    -
+    
+    Step 2 (distance=2): Each remaining thread shares with thread+2
+    Thread 0 shares with Thread 2:  9+15=24
+    Thread 1 shares with Thread 3:  5+7=12
+    After step 2:
+    Thread:   0    1    2    3    4    5    6    7
+    Value:    24   12   -    -    -    -    -    -
+    
+    Step 3 (distance=1): Final share
+    Thread 0 shares with Thread 1:  24+12=36
+    Final Result:
+    Thread:   0    1    2    3    4    5    6    7
+    Value:    36   -    -    -    -    -    -    -
+    ```
+    Why is this efficient?
 
-Step 1 (distance=4): Each thread shares with thread+4
-Thread 0 shares with Thread 4:  5+4=9
-Thread 1 shares with Thread 5:  3+2=5
-Thread 2 shares with Thread 6:  8+7=15
-Thread 3 shares with Thread 7:  1+6=7
-After step 1:
-Thread:   0    1    2    3    4    5    6    7
-Value:    9    5    15   7    -    -    -    -
+    - All additions in each step happen in parallel
+    - We only need `log2(n)` steps (3 steps for 8 threads)
+    - Much faster than having one thread add everything sequentially
 
-Step 2 (distance=2): Each remaining thread shares with thread+2
-Thread 0 shares with Thread 2:  9+15=24
-Thread 1 shares with Thread 3:  5+7=12
-After step 2:
-Thread:   0    1    2    3    4    5    6    7
-Value:    24   12   -    -    -    -    -    -
+    In our LayerNorm implementation, we use this same principle but with 32 threads (one warp). The GPU provides a special instruction called `__shfl_down_sync` to make these sharing operations very fast:
+    ```cuda
+    // Stage 1: Warp-level reduction
+    // A warp is 32 threads that can share data very quickly using shuffle operations
+    
+    // Let's say our threads start with these values:
+    // Thread:  0   1   2   3   4   5   6   7   ...  31
+    // Values:  4   2   6   3   1   7   2   8   ...   5
+    
+    // __shfl_down_sync parameters:
+       // 1. 0xffffffff - bitmask telling which threads participate (here, all 32)
+       // 2. sum - the value we want to share
+       // 3. distance - how many threads down to share with (like our 4,2,1 pattern)
+    
+    // First shuffle: distance = 16
+    sum = __shfl_down_sync(0xffffffff, sum, 16);
+    // After first shuffle:
+    // Thread:  0   1   2   3   4   5   6   7   ...  15  16  17  18  ...  31
+    // Values:  4+5 2+1 6+8 3+4 1+6 7+2 2+9 8+3  ...      -   -   -   ...   -
+    // Threads 0-15 now have sums of their value + thread+16's value
+    // Threads 16-31 are done
+    
+    // Keep halving distance: 8, 4, 2, 1
+    sum = __shfl_down_sync(0xffffffff, sum, 8);
+    sum = __shfl_down_sync(0xffffffff, sum, 4);
+    sum = __shfl_down_sync(0xffffffff, sum, 2);
+    sum = __shfl_down_sync(0xffffffff, sum, 1);
+    ```
+    The `_shfl_down_sync` instruction makes sharing operations very fast _within_ a warp. For sharing between warps, we need to use a special shared memory, called `__shared__` in CUDA:
+    ```cuda
+    // Stage 2: Block-level sharing
+    // Each warp has calculated its own sum, but warps can't directly share data
+    // with each other. We need shared memory for that.
+    __shared__ float shared_data[32];  // Creates array in special "shared memory" - 
+                                       // ultra-fast memory that all threads in a block 
+                                       // can access. One slot per warp.
+    ```
+    Why we do this:
+      - Start with fast warp shuffles (like passing notes to nearby coworkers)
+      - Then use shared memory for warps to communicate (like using a shared whiteboard)
+      - Much faster than having all threads read/write to global memory
 
-Step 3 (distance=1): Final share
-Thread 0 shares with Thread 1:  24+12=36
-Final Result:
-Thread:   0    1    2    3    4    5    6    7
-Value:    36   -    -    -    -    -    -    -
-```
-Why is this so efficient?
-   - All additions in each step happen in parallel
-   - We only need log2(n) steps (3 steps for 8 threads)
-   - Much faster than having one thread add everything sequentially
-
-   In our LayerNorm implementation, we use this same principle but with 32 threads (one warp). The GPU provides a special instruction called `__shfl_down_sync` to make these sharing operations very fast:
-```cuda
-// Stage 1: Warp-level reduction
-// A warp is 32 threads that can share data very quickly using shuffle operations
-
-// Let's say our threads start with these values:
-// Thread:  0   1   2   3   4   5   6   7   ...  31
-// Values:  4   2   6   3   1   7   2   8   ...   5
-
-// __shfl_down_sync parameters:
-   // 1. 0xffffffff - bitmask telling which threads participate (here, all 32)
-   // 2. sum - the value we want to share
-   // 3. distance - how many threads down to share with (like our 4,2,1 pattern)
-
-// First shuffle: distance = 16
-sum = __shfl_down_sync(0xffffffff, sum, 16);
-// After first shuffle:
-// Thread:  0   1   2   3   4   5   6   7   ...  15  16  17  18  ...  31
-// Values:  4+5 2+1 6+8 3+4 1+6 7+2 2+9 8+3  ...      -   -   -   ...   -
-// Threads 0-15 now have sums of their value + thread+16's value
-// Threads 16-31 are done
-
-// Keep halving distance: 8, 4, 2, 1
-sum = __shfl_down_sync(0xffffffff, sum, 8);
-sum = __shfl_down_sync(0xffffffff, sum, 4);
-sum = __shfl_down_sync(0xffffffff, sum, 2);
-sum = __shfl_down_sync(0xffffffff, sum, 1);
-```
-The `_shfl_down_sync` instruction makes sharing operations very fast _within_ a warp. For sharing between warps, we need a different approach:
-```cuda
-// Stage 2: Block-level sharing
-// Once each warp has its sum, we need to share between warps
-__shared__ float shared_data[32];  // Special fast memory visible to all threads
-                                  // in the same block
-```
-Why we do this:
-   - Start with fast warp shuffles (like passing notes to nearby coworkers)
-   - Then use shared memory for warps to communicate (like using a shared whiteboard)
-   - Much faster than having all threads read/write to global memory
-
-## 3. Implementing LayerNorm in CUDA
+## Implementing LayerNorm in CUDA
 Now we can put all these concepts together to implement LayerNorm in CUDA. First the implementation consists of two files:
 1. `layernorm_cuda.cpp`: The C++ interface that PyTorch uses to call our CUDA kernel
 2. `layernorm_kernel.cu`: The actual CUDA kernel implementation
