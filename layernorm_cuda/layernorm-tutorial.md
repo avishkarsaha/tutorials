@@ -665,24 +665,44 @@ This launch configuration means:
 ### Kernel Implementation
 Now let's go through the LayerNorm kernel step by step. We'll start with how each block gets set up to handle its sequence:
 
-#### Thread and Memory Setup
+#### Thread and Block Organization
+Our LayerNorm implementation uses a simple but effective parallelization strategy: each CUDA block processes one sequence in the batch. Here's how we set up the threads and memory access:
+
 ```cuda
-const int batch_idx = blockIdx.x;    // Which sequence in batch
+// Thread identification
+const int batch_idx = blockIdx.x;    // Which sequence in batch (one per block)
 const int tid = threadIdx.x;         // Thread ID within block (0-255)
 const int lane_id = tid % WARP_SIZE; // Position within warp (0-31)
 
-// Get pointers to start of this sequence's input and output data
-// Pointer arithmetic once at start - avoid repeated calculations
-const T* row_input = input + batch_idx * hidden_size;  // Point to start of this batch's input row
-T* row_output = output + batch_idx * hidden_size;      // Point to start of this batch's output row
+// Calculate pointers to this sequence's data (done once at start)
+const T* row_input = input + batch_idx * hidden_size;  // Input sequence start
+T* row_output = output + batch_idx * hidden_size;      // Output sequence start
 ```
-Optimization principles applied:
-   - Compute indices once and store in registers (fastest memory)
-   - Pre-calculate pointers for coalesced memory access
-   - Each block handles one sequence to minimize thread divergence
+This setup is optimized in several ways:
 
-#### Step 1: Computing the Mean
-First, threads cooperatively gather their partial sums:
+1. Block-Sequence Mapping: Each block handles exactly one sequence, making the code:
+
+* Easy to reason about (clear 1:1 mapping)
+* Free from inter-block synchronization
+* Efficient for typical sequence lengths (256-4096 elements)
+
+2. Thread Organization: We track three levels of thread identity:
+
+* batch_idx: Which sequence this block processes
+* tid: Thread's position within its block (0-255)
+* lane_id: Thread's position within its warp (0-31)
+
+3. Memory Access: We optimize memory operations by:
+
+* Computing pointer offsets once at the start
+* Storing them in registers for fast access
+* Setting up for coalesced memory access patterns
+
+This organization provides the foundation for our efficient three-level reduction strategy in the following steps.
+
+#### Step 1: Computing the Mean: A Three-Level Reduction
+Computing the mean requires summing all elements and dividing by the sequence length. We do this in three stages, carefully optimizing each level of the GPU memory hierarchy:
+1. Thread-Level Accumulation:
 ```cuda
 // Each thread accumulates its assigned elements
 float sum = 0.0f;  // Use register for fastest repeated access
@@ -690,11 +710,13 @@ for(int i = tid; i < hidden_size; i += blockDim.x) {
     sum += static_cast<float>(row_input[i]);
 }
 ```
-Memory optimization principles:
-*    Coalesced memory access: Adjacent threads read adjacent memory locations
-*    Register usage: sum stays in register for fast accumulation
-*    Strided access pattern: Ensures efficient memory bandwidth usage
+At this stage, each thread:
+* Starts at its thread ID and steps by block size (256)
+* Keeps its partial sum in a register (fastest memory)
+* Uses coalesced memory access (adjacent threads read adjacent memory)
+* Uses FP32 for accumulation (better precision)
 
+2. Warp-Level Reduction:
 Then comes the warp-level reduction to combine these partial sums:
 ```cuda
 // Fast warp-level reduction using shuffle instructions
@@ -710,11 +732,54 @@ if (lane_id == 0) {
 }
 __syncthreads();
 ```
-Communication optimization principles:
-* Use warp shuffles: Fastest way for threads in a warp to share data
-* Minimal shared memory: Only one value per warp
-* Minimal synchronization: Only sync when absolutely necessary
-* Memory hierarchy: Registers → Warp Shuffles → Shared Memory
+This stage optimizes intra-warp communication:
+* Uses warp shuffles instead of shared memory (faster)
+* Each warp reduces 32 values to a single sum
+* Only the first thread in each warp writes to shared memory
+* Minimal synchronization (only after all warps write)
+
+3. Final Cross-Warp Reduction:
+Finally, we reduce the partial sums from each warp to get the final mean:
+```cuda
+// Load warp sums into first warp
+if (tid < (blockDim.x + WARP_SIZE - 1) / WARP_SIZE) {
+    sum = s_partial_sums[tid];
+} else {
+    sum = 0.0f;
+}
+
+// First warp does final reduction
+if (tid < WARP_SIZE) {
+    #pragma unroll
+    for(int offset = WARP_SIZE/2; offset > 0; offset /= 2) {
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
+    }
+}
+
+// Store final mean
+__shared__ float s_mean;
+if (tid == 0) {
+    s_mean = sum / hidden_size;
+}
+__syncthreads();
+```
+
+The final stage completes the reduction:
+* First warp gathers all partial sums
+* Uses the same efficient warp-shuffle reduction
+* Single thread computes and stores the final mean
+* One final sync ensures all threads see the result
+
+**Key Optimization Principles**
+Our three-level reduction strategy optimizes for the GPU memory hierarchy:
+
+1. Registers: Thread-local sums stay in the fastest memory
+2. Warp Shuffles: Fast data sharing within warps
+3. Shared Memory: Minimal usage only for cross-warp communication
+4. Global Memory: Coalesced access pattern for maximum bandwidth
+5. Synchronization: Minimized to only when absolutely necessary
+
+
 
 #### Step 2: Computing the Variance
 
